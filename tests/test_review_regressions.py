@@ -698,6 +698,19 @@ def test_indivisible_export_finishes_past_deadline_but_honors_cancellation(store
     assert not (store.root / "cancelled-export.json").exists()
 
 
+def test_a_unit_named_after_a_practice_moment_resumes(store):
+    from songe.sleep.worker import Journal
+
+    journal = Journal(store.root, lambda: None, store, store.slice())
+    # The judged gate names its units after the moment: "practice:<scene>#v1".
+    name = "judged-before-practice:sig3#v1"
+    assert journal.unit(name, lambda: {"text": "answer"}) == {"text": "answer"}
+    # Saved under a file name every system allows, and found there again.
+    assert (store.root / "judged-before-practice_sig3#v1.json").exists()
+    assert journal.unit(name, lambda: pytest.fail("answered again")) == {"text": "answer"}
+    assert journal.load(name, None) == {"text": "answer"}
+
+
 def test_scoring_backlog_with_equal_revision_is_not_skipped(store):
     steps = [
         {

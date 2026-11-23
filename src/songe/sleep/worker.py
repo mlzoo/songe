@@ -133,7 +133,7 @@ class Journal:
             )
 
     def unit(self, name, fn):
-        path = self.root / (name + ".json")
+        path = self.path(name)  # where commit writes it
         if path.exists():
             return json.loads(path.read_text(encoding="utf-8"))
         self.check()
