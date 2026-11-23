@@ -248,17 +248,56 @@ def test_frozen_prefix_keeps_the_exact_forward_with_a_short_gradient_window(
     assert prefixes == [] and tokens == len(y)
     backend.config.max_sequence, backend.config.teacher_chunk = len(y) + 4, 5
     windowed, grads, tokens = backend.train_step(step, seed=8)
-    # Only the last four context tokens plus the response carry gradient.
-    # Under gradient checkpointing transformers drops the cache in training,
-    # so the student sees only the window (bounded memory); the loss then
-    # differs from the full-context one but stays finite and trainable.
-    expected = [] if checkpointing else [student[: len(student) - 4]]
-    assert prefixes == expected and tokens == len(y)
-    if not checkpointing:
-        assert windowed == pytest.approx(full, rel=1e-4, abs=1e-7)
+    # Only the last four context tokens plus the response carry gradient; the
+    # context before them is still read, so the student sees what the teacher
+    # sees and the loss is the full-context one. That holds under gradient
+    # checkpointing too, where transformers alone would drop the prefix.
+    assert prefixes == [student[: len(student) - 4]] and tokens == len(y)
+    assert windowed == pytest.approx(full, rel=1e-4, abs=1e-7)
     assert grads.keys() == full_grads.keys()
     assert all(torch.isfinite(g).all() for g in grads.values())
     assert any(g.abs().sum() > 0 for g in grads.values())
+
+
+def test_checkpointing_reads_the_frozen_prefix_once(backend, step, monkeypatch):
+    y = [7, 8, 9]
+    monkeypatch.setattr(backend, "sample", lambda *args, **kwargs: (y, "", None))
+    backend.config.max_sequence, backend.config.teacher_chunk = len(y) + 4, 5
+    student, _ = paired_prompts(backend.tokenizer, step, backend.config)
+    caches = []
+    original = backend.prefix_state
+    monkeypatch.setattr(
+        backend, "prefix_state", lambda ids: caches.append(original(ids)) or caches[-1]
+    )
+    loss, grads, _ = backend.train_step(step, seed=8)
+    # The backward pass runs each layer again; the prefix must not grow.
+    assert caches[0].get_seq_length() == len(student) - 4
+    assert not backend._window_only
+    assert all(
+        "_can_checkpoint_with_cache" not in vars(m) for m in backend.model.modules()
+    )
+    backend.model.gradient_checkpointing_disable()
+    plain_loss, plain, _ = backend.train_step(step, seed=8)
+    assert loss == pytest.approx(plain_loss, rel=1e-5, abs=1e-7)
+    for name, grad in grads.items():
+        assert torch.allclose(grad, plain[name], rtol=1e-4, atol=1e-7), name
+
+
+def test_a_prefix_that_cannot_be_frozen_leaves_the_window(backend, step, monkeypatch):
+    y = [7, 8, 9]
+    monkeypatch.setattr(backend, "sample", lambda *args, **kwargs: (y, "", None))
+    full, _, _ = backend.train_step(step, seed=8)
+    backend.config.max_sequence, backend.config.teacher_chunk = len(y) + 4, 5
+    prefixes = []
+    # A recurrent state, say: not a key-value cache the layers can read twice.
+    monkeypatch.setattr(
+        backend, "prefix_state", lambda ids: prefixes.append(ids) or object()
+    )
+    windowed, grads, _ = backend.train_step(step, seed=8)
+    assert backend._window_only and windowed != pytest.approx(full, rel=1e-4)
+    assert all(torch.isfinite(g).all() for g in grads.values())
+    backend.train_step(step, seed=8)
+    assert len(prefixes) == 1  # not read again for nothing
 
 
 def test_lora_scale_follows_alpha_over_rank(backend):
