@@ -11,7 +11,9 @@ parsed.
   session it came from (a shared file name alone is not a copy)
 - matters: shown the scene, its own lesson and a distinct lesson from
   another session, the model picks its own. Asked about a single lesson,
-  the model said yes to every scene.
+  the model said yes to every scene. With no other session's lesson to
+  compare with (a first session), a stock lesson stands in, so the check
+  always runs.
 
 Drop codes are the first failed check, in this order (docs/CONTRACTS.md).
 """
@@ -47,6 +49,16 @@ Which lesson is about the agent's next action in this situation? Answer "neither
 Answer with JSON: why (one sentence), then answer (A, B or neither)."""
 
 ORDER = ("built", "decision", "parses", "not_copy", "matters")
+
+# Stand-ins for "a lesson from another session" when there is none yet: plain
+# coding-agent advice on unrelated subjects.
+STOCK_LESSONS = (
+    "Write commit messages in the imperative mood, under 72 characters.",
+    "Pin dependency versions in the lockfile before a release.",
+    "Add a docstring to every public function.",
+    "Store timestamps in UTC and convert them only for display.",
+    "Give database migrations a matching rollback step.",
+)
 
 
 def render_text(messages, limit=4000):
@@ -135,14 +147,15 @@ def copy_evidence(scene, files, requests, code):
 
 
 def placebo_for(practice_id, signal, lessons):
-    """A deterministic, distinct lesson from another session and the prompt order."""
+    """A deterministic, distinct lesson from another session (a stock lesson
+    when there is none) and the prompt order."""
     real = signal["lesson"].strip()
     others = sorted({
         text for session, lesson in lessons
         if session != signal["session"] and (text := lesson.strip()) and text != real
-    })
+    }) or [text for text in STOCK_LESSONS if text != real]
     h = int(hashlib.sha256(practice_id.encode()).hexdigest(), 16)
-    return (others[h % len(others)] if others else None), h % 2 == 0
+    return others[h % len(others)], h % 2 == 0
 
 
 async def check(row, signal, items, reader, lessons):
@@ -162,19 +175,18 @@ async def check(row, signal, items, reader, lessons):
     why = {"parse_errors": errors, "copy_evidence": evidence}
     if all(c[k] for k in ORDER[:4]):
         placebo, real_first = placebo_for(row["id"], signal, lessons)
-        if placebo:
-            real = signal["lesson"]
-            a, b = (real, placebo) if real_first else (placebo, real)
-            answer = await reader.ask(
-                MATTERS.format(dream=render_text(messages, limit=2500), a=a, b=b),
-                MATTERS_SCHEMA,
-                "matters",
-                max_tokens=600,
-            )
-            c["matters"] = answer.get("answer") == ("A" if real_first else "B")
-            why["matters_answer"] = (
-                "real" if c["matters"] else "neither" if answer.get("answer") == "neither" else "placebo"
-            )
-            why["matters_why"] = answer.get("why")
+        real = signal["lesson"]
+        a, b = (real, placebo) if real_first else (placebo, real)
+        answer = await reader.ask(
+            MATTERS.format(dream=render_text(messages, limit=2500), a=a, b=b),
+            MATTERS_SCHEMA,
+            "matters",
+            max_tokens=600,
+        )
+        c["matters"] = answer.get("answer") == ("A" if real_first else "B")
+        why["matters_answer"] = (
+            "real" if c["matters"] else "neither" if answer.get("answer") == "neither" else "placebo"
+        )
+        why["matters_why"] = answer.get("why")
     drop = next((k for k in ORDER if c[k] is False), None)
     return c, drop, why

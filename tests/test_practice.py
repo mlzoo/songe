@@ -6,7 +6,7 @@ import copy
 import json
 
 from songe.practice import store as practice
-from songe.practice.checks import placebo_for
+from songe.practice.checks import STOCK_LESSONS, placebo_for
 from songe.reading import store as reading
 from songe.reading import timeline
 from tests.test_reading import SCENE, FakeReader, args, record_session
@@ -27,6 +27,7 @@ class Writer(FakeReader):
             return copy.deepcopy(self.scene)
         if name == "matters":
             self.asked.append(name)
+            self.prompts.append(prompt)
             real = prompt.split("A: ", 1)[1].startswith("Check which file")
             return {"why": "w", "answer": self.pick or ("A" if real else "B")}
         return await super().ask(prompt, schema, name)
@@ -56,8 +57,9 @@ def test_a_scene_is_framed_on_the_logged_request_and_kept(store):
     # The prompt carries the lesson and a short summary, never the session.
     assert "Check which file the failing test covers" in writer.prompts[0]
     assert "fix the failing test" not in writer.prompts[0]
-    # One session only: no lesson from elsewhere to compare with.
-    assert row["checks"]["matters"] is None
+    # One session only: the forced choice still runs, against a stock lesson.
+    assert writer.asked == ["dream", "matters"] and row["checks"]["matters"] is True
+    assert any(f": {text}\n" in writer.prompts[1] for text in STOCK_LESSONS)
 
 
 def test_scenes_that_fail_a_check_are_dropped_with_its_code(store):
@@ -102,12 +104,30 @@ def test_a_repeated_lesson_from_another_session_cannot_be_its_own_placebo(store)
             ("s2", json.dumps(duplicate)),
         )
 
-    writer = Writer(pick="neither")
+    writer = Writer()
     asyncio.run(practice.write(store, writer, 1))
 
     (row,) = practice.practice(store)
-    assert writer.asked == ["dream"]
-    assert row["checks"]["matters"] is None and row["drop"] is None
+    assert writer.asked == ["dream", "matters"]
+    assert writer.prompts[1].count(original["lesson"]) == 1
+    assert row["checks"]["matters"] is True and row["drop"] is None
+
+
+def test_a_first_session_scene_about_something_else_is_dropped(store):
+    # With one session there is no other lesson to compare with; the scene
+    # used to be kept unchecked (matters stayed None, and None is not a drop).
+    row = written(store, pick="neither")[0][0]
+    assert row["checks"]["matters"] is False and row["drop"] == "matters"
+    assert row["why"]["matters_answer"] == "neither"
+
+
+def test_placebo_falls_back_to_a_stock_lesson_other_than_the_real_one():
+    for real in ("Use uv for tests.", *STOCK_LESSONS):
+        signal = {"session": "s1", "lesson": f" {real} "}
+        for scene in ("a", "b", "c", "d", "e", "f"):
+            # A lesson of the same session is not a placebo.
+            placebo, _ = placebo_for(scene, signal, [("s1", "Run ruff first.")])
+            assert placebo in STOCK_LESSONS and placebo != real
 
 
 def test_placebo_selection_uses_a_distinct_lesson_when_available():
