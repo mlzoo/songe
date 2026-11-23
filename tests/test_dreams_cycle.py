@@ -537,11 +537,15 @@ def test_the_gate_judges_what_each_version_writes(monkeypatch):
     shown = judged.examples(steps, before, after, rows)
     assert [e["source"] for e in shown] == ["original", "original", "practice"]  # real conversations first
     assert shown[0]["feedback"] == "use pnpm here, never npm" and shown[2]["lesson"] == "Always use pnpm."
-    # The judge prefers the old answer: a loss. The same action: a tie, no judge asked.
-    verdicts["say"] = '{"follows": "both"}'
-    monkeypatch.setattr(judged, "teacher_logprob", lambda b, t, y: -1.0 if y == [1.0] else 0.0)
-    monkeypatch.setattr(judged, "plain_logprob", lambda b, s, y: -0.5)
-    assert judged.outcome(backend, steps[0], before["s0"], after["s0"]) == ("loss", "teacher")
+    # The judge does not decide: a tie, whatever it said. The teacher is not
+    # asked (this backend has none): its preference is what training fits.
+    for say, why in (('{"follows": "both"}', "both"), ('{"follows": "neither"}', "neither"),
+                     ("Let me think about the two answers", "unclear")):
+        verdicts["say"] = say
+        assert judged.outcome(backend, steps[0], before["s0"], after["s0"]) == ("tie", why)
+    rows = judged.judge(backend, Journal(), steps, before, after, "scale-1.0", lambda: None)
+    assert judged.summary(rows) == {"count": 0, "worse": 0, "same": 3, "checked": 3, "available": 3}
+    # The same action: a tie, no judge asked.
     assert judged.outcome(backend, steps[0], before["s0"], before["s0"]) == ("tie", "same")
 
 
@@ -570,9 +574,6 @@ def test_near_identical_calls_tie_and_a_judge_that_always_picks_one_side_counts_
     read = lambda offset: {"text": "", "tool_calls": [{"name": "read", "arguments": {"path": "snake.py", "offset": offset}}]}  # noqa: E731
     assert not differs(read(20), read(21))
     monkeypatch.setattr(judged, "render", lambda tok, messages, tools, **kw: messages[0]["content"])
-    monkeypatch.setattr(judged, "paired_prompts", lambda tok, step, config: ([1], [2]))
-    monkeypatch.setattr(judged, "teacher_logprob", lambda b, t, y: 0.0)
-    monkeypatch.setattr(judged, "plain_logprob", lambda b, s, y: 0.0)
 
     class AlwaysA:
         tokenizer = config = None
