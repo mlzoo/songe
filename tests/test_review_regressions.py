@@ -313,6 +313,42 @@ def test_late_recording_is_reconstructed_incrementally(config, store):
         assert db.execute("SELECT COUNT(*) FROM scoreboard").fetchone()[0] == 1
 
 
+@pytest.mark.parametrize(
+    "messages",
+    [
+        None,  # {"messages": null}: the model server answers 400, it is recorded all the same
+        "hi",
+        ["hi"],
+        # A lone surrogate, as an agent leaves when it cuts tool output inside
+        # an emoji: valid JSON, but it cannot be encoded to hash it.
+        [{"role": "user", "content": json.loads('"cut \\ud83d"')}],
+    ],
+)
+def test_an_unreadable_recording_does_not_hold_back_the_ones_after_it(config, store, messages):
+    store.record(
+        "/v1/chat/completions",
+        {"model": config.public_model, "messages": messages},
+        {"error": {"message": "bad request"}},
+        status=400,
+        started=1,
+    )
+    context = [{"role": "user", "content": "Question"}]
+    action = {"role": "assistant", "content": "answer"}
+    store.record(
+        "/v1/chat/completions",
+        {"model": config.public_model, "messages": context},
+        {"choices": [{"message": action}]},
+        started=2,
+    )
+    # The unreadable one comes first in every batch until it is passed over.
+    assert store.reconstruct() == (1, 2)
+    assert [s["action"] for s in store.active_steps()] == [action]
+    with store.connect() as db:
+        marks = db.execute("SELECT resolved FROM reconstructed ORDER BY exchange_id").fetchall()
+    assert [m[0] for m in marks] == [1, 1]
+    assert store.reconstruct() == (0, 0)  # and it is not tried again
+
+
 def test_diagnostics_preserve_safe_exception_locations():
     import logging
 
