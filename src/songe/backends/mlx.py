@@ -370,9 +370,10 @@ class Backend:
     def kl_from(self, base, prompt, teacher_prompt, y, *, hindsight=False):
         reference = base.teacher if hindsight else base.base
         mx = self.mx
-        with reference():
-            teacher_h = base.teacher_hidden(teacher_prompt, y)
-            mx.eval(teacher_h)
+        # Passed in, not entered here: teacher_hidden reads with the original
+        # base unless it is given the context that selects the weights (and it
+        # evaluates the result before leaving that context).
+        teacher_h = base.teacher_hidden(teacher_prompt, y, reference())
         candidate_h = self.hidden(prompt + y[:-1])[:, response_positions(prompt, y)]
         mx.eval(candidate_h)
         total = 0.0

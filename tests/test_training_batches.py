@@ -466,6 +466,57 @@ def test_torch_teacher_is_the_cycle_start_snapshot():
     assert backend.model.training and based == [True]
 
 
+def test_mlx_heldout_kl_reads_the_teacher_with_the_cycle_start_weights():
+    import contextlib
+
+    import numpy as np
+
+    from songe.backends.mlx import Backend
+    from tests.test_learning import NumpyAPI
+
+    class Version:
+        """The backend whose teacher is asked, as backends/mlx.py does it:
+        teacher_hidden reads with the original base unless told otherwise."""
+
+        config = SimpleNamespace(token_chunk=2)
+        weights, read_with = "candidate", []
+
+        @contextlib.contextmanager
+        def using(self, weights):
+            previous, self.weights = self.weights, weights
+            try:
+                yield
+            finally:
+                self.weights = previous
+
+        def teacher(self):
+            return self.using("cycle start")
+
+        def base(self):
+            return self.using("original base")
+
+        def teacher_hidden(self, prompt, y, teacher=None):
+            with teacher if teacher is not None else self.base():
+                self.read_with.append(self.weights)
+                return np.zeros((1, len(y), 3))
+
+        def head(self, hidden):
+            return hidden
+
+    class API(NumpyAPI):
+        eval = staticmethod(lambda *arrays: None)
+
+    candidate = Backend.__new__(Backend)
+    candidate.mx, candidate.check = API, lambda: None
+    candidate.hidden = lambda ids: np.zeros((1, len(ids), 3))
+    candidate.head = lambda hidden: hidden
+    version = Version()
+    assert candidate.kl_from(version, [1, 2], [1, 2, 3], [4, 5, 6], hindsight=True) == 0
+    assert candidate.kl_from(version, [1, 2], [1, 2], [4, 5, 6]) == 0
+    # Held-out hindsight KL: the version the cycle started from. Drift: the base.
+    assert version.read_with == ["cycle start", "original base"]
+
+
 def test_mlx_teacher_is_the_cycle_start_snapshot(monkeypatch):
     import contextlib
 

@@ -922,8 +922,9 @@ class TorchBackend:
 
     def kl_from(self, base, prompt, teacher_prompt, y, *, hindsight=False):
         reference = base.teacher if hindsight else base.base
-        with reference():
-            teacher_h = base.teacher_hidden(teacher_prompt, y)
+        # Passed in, not entered here: teacher_hidden reads with the original
+        # base unless it is given the context that selects the weights.
+        teacher_h = base.teacher_hidden(teacher_prompt, y, reference())
         total = 0.0
         with self.torch.no_grad():
             candidate_h = self._response_hidden(prompt, y)

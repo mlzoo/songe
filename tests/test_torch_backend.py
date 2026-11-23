@@ -335,6 +335,23 @@ def test_update_frozen_teacher_checkpoint_and_deltas(backend, step, tmp_path):
         backend.apply(bad)
 
 
+def test_heldout_kl_is_measured_against_the_cycle_start_teacher(backend, step):
+    # A second Dream: the version it starts from already has an adapter.
+    generator = torch.Generator().manual_seed(3)
+    with torch.no_grad():
+        for p in backend.model.parameters():
+            if p.requires_grad:
+                p.add_(0.05 * torch.randn(p.shape, generator=generator))
+    backend.snapshot_teacher()
+    student, _ = paired_prompts(backend.tokenizer, step, backend.config)
+    y = [7, 8, 9]
+    # The candidate is still the teacher and reads the same prompt: no
+    # distance to the cycle's teacher, a real one to the original base.
+    assert backend.kl_from(backend, student, student, y, hindsight=True) == pytest.approx(0, abs=1e-6)
+    assert backend.kl_from(backend, student, student, y) > 1e-4
+    assert backend.compare(student, student, y) == pytest.approx(0, abs=1e-6)
+
+
 def test_nucleus_filter_precedes_temperature_and_retains_boundary_ties():
     logits = torch.tensor([[0.5, 0.3, 0.2]]).log()
     actual = sampling_probabilities(logits, temperature=0.5, top_p=0.6)
