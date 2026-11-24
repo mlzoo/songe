@@ -992,12 +992,36 @@ def run(
                 record["judged_error"] = type(exc).__name__
                 moments = []
 
+        # Moments the lessons are not about (the drift set: the base was
+        # right there and nothing was trained on them). Each version answers
+        # them too; how often the candidate acts differently is recorded
+        # beside the gate and decides nothing.
+        others = judged.unrelated(drift_set) if moments else []
+        before_others = {}
+
+        def answer_others(name):
+            try:
+                return judged.answers(backend, journal, others, name, check)
+            except (Interrupted, MemoryError):
+                raise
+            except Exception as exc:  # noqa: BLE001 - a record, never the Dream
+                import logging
+
+                logging.getLogger("songe").warning("unrelated_unavailable %s: %s", type(exc).__name__, exc)
+                others.clear()
+                return {}
+
+        if others:
+            before_others = answer_others("unrelated-before")
+
         def with_outcomes(rows, scale):
             """The gate's rows with each judged moment's outcome (win, loss,
             tie) for this strength; the candidate is loaded at that strength."""
             if not moments:
                 return rows  # the KL decides (judging unavailable)
             backend.scale_delta(baseline, trained, scale)
+            if others:
+                answer_others(f"unrelated-scale-{scale}")
             try:
                 after_answers = judged.answers(backend, journal, moments, f"scale-{scale}", check)
                 verdicts = {r["id"]: r for r in judged.judge(
@@ -1141,6 +1165,13 @@ def run(
         )
         record["scale_evaluations"] = scales
         record["wake_scale"] = scale
+        if others:
+            # From the journal, so a resumed check reports every strength tried.
+            counts = {
+                str(k): judged.acts_differently(journal, others, before_others, f"unrelated-scale-{k}")
+                for k in config.wake_scales
+            }
+            record["unrelated_actions"] = {k: v for k, v in counts.items() if v["checked"]}
         defer_export = kind == "gguf-lora" and backend.kind == "mlx"
         if scale is None:
             last_measurement = next(reversed(scales.values()), {})

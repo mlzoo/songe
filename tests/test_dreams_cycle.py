@@ -153,6 +153,60 @@ def test_the_cycle_records_which_drift_measure_gated(dreams):
     assert check["drift_set"] is not None
 
 
+def test_unrelated_moments_are_one_per_conversation_and_counted_from_the_journal():
+    from songe.sleep import judged
+
+    steps = [{"id": f"m{i}", "conversation": f"c{i // 2}"} for i in range(24)]  # 12 conversations
+    chosen = judged.unrelated(steps)
+    assert len(chosen) == judged.UNRELATED == 8
+    assert len({s["conversation"] for s in chosen}) == 8  # one each
+    assert chosen == judged.unrelated(steps)  # the same ones every Dream
+    assert judged.unrelated([]) == []
+
+    def call(command):
+        return {"text": "", "tool_calls": [{"name": "shell", "arguments": {"command": command}}]}
+
+    class Journal:
+        saved = {
+            "judged-unrelated-scale-1.0-a": call("pytest -q"),          # the same action
+            "judged-unrelated-scale-1.0-b": call("pnpm add lodash"),    # another one
+            # c was not answered at this strength (the check stopped there).
+        }
+
+        def load(self, name, default):
+            return self.saved.get(name, default)
+
+    moments = [{"id": i, "conversation": i} for i in "abc"]
+    before = {"a": call("pytest -q"), "b": call("cat README.md"), "c": call("ls")}
+    assert judged.acts_differently(Journal(), moments, before, "unrelated-scale-1.0") == {"changed": 1, "checked": 2}
+    assert judged.acts_differently(Journal(), moments, before, "unrelated-scale-0.5") == {"changed": 0, "checked": 0}
+
+
+def test_the_cycle_records_how_often_the_candidate_acts_differently_elsewhere(dreams, monkeypatch):
+    """Confirmed successes are moments no lesson is about. Each version
+    answers a few of them and the record says how often the action changed."""
+    from songe.sleep import gate
+
+    config, store = dreams
+    for i in range(3):
+        add_success(store, f"s{i}", [{"role": "user", "content": f"run the tests {i}"}])
+    # The stand-in backend answers a moment the way the real ones are asked to.
+    plain = Model.sample
+    monkeypatch.setattr(Model, "sample", lambda self, prompt, seed=None, **kw: plain(self, prompt, seed))
+    # Full strength is measured (and then rejected, as in the other tests).
+    monkeypatch.setattr(gate, "choose_scale", lambda evaluate_scale, *a, **kw: (
+        evaluate_scale(1.0) and None, Decision(False, "Test rejection"), {}))
+    result = worker.run(config, store)
+    assert "judged_error" not in result
+    assert result["unrelated_actions"] == {"1.0": {"changed": 0, "checked": 3}}
+    # No successes yet: nothing to answer, and no entry.
+    store.set("experience_watermark", 0)
+    add_practice(store, 1, start=20)
+    with store.connect() as db:
+        db.execute("DELETE FROM signals WHERE id LIKE 'ok-%'")
+    assert "unrelated_actions" not in worker.run(config, store)
+
+
 def test_drift_set_gates_only_when_big_and_narrow_enough(config):
     refs = [{"conversation": f"c{i}"} for i in range(12)]
     config.min_drift, config.general_drift_limit = 10, 0.05

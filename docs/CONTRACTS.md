@@ -724,6 +724,12 @@ most a one-line label on an example.
   record carries `judged` rows, `improved` {count, worse, same, checked} and
   the report's examples are the moments won. If the backend cannot answer,
   the KL decides and `judged_error` says so.
+  Each version also answers up to 8 moments the lessons are not about (the
+  drift set's confirmed successes, one per conversation). The record's
+  `unrelated_actions` is, per strength tried, {changed, checked}: at how many
+  of them the candidate takes another action than the version in use
+  (`quick.differs`). Recorded only: it decides nothing. Absent when there
+  are no confirmed successes yet.
 
 **Dream control**
 
