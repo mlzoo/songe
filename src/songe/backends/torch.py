@@ -921,11 +921,23 @@ class TorchBackend:
             self._peak_rss = self._process.memory_info().rss
 
     def kl_from(self, base, prompt, teacher_prompt, y, *, hindsight=False):
+        return self.measure(base, prompt, teacher_prompt, y, hindsight=hindsight)["kl"]
+
+    def measure(self, base, prompt, teacher_prompt, y, *, hindsight=False):
+        """This version against the reference along y, per answer token: the
+        KL, and what a mean KL does not show: each side's entropy (nats) and
+        how often their most likely token is the same. From the logits the
+        KL is computed on, so it costs no forward pass."""
         reference = base.teacher if hindsight else base.base
         # Passed in, not entered here: teacher_hidden reads with the original
         # base unless it is given the context that selects the weights.
         teacher_h = base.teacher_hidden(teacher_prompt, y, reference())
-        total = 0.0
+        total = {"kl": 0.0, "entropy": 0.0, "reference_entropy": 0.0, "agreement": 0.0}
+
+        def entropy(logits):
+            # entr(0) is 0: a token with no probability adds nothing.
+            return float(self.torch.special.entr(logits.float().softmax(-1)).sum())
+
         with self.torch.no_grad():
             candidate_h = self._response_hidden(prompt, y)
             for start in range(0, len(y), base.config.token_chunk):
@@ -933,9 +945,14 @@ class TorchBackend:
                 end = min(start + base.config.token_chunk, len(y))
                 with reference():
                     teacher = base.head(teacher_h[:, start:end])
-                value = divergence(self.head(candidate_h[:, start:end]), teacher)
-                total += float(value) * (end - start)
-        return total / len(y)
+                student = self.head(candidate_h[:, start:end])
+                total["kl"] += float(divergence(student, teacher)) * (end - start)
+                total["entropy"] += entropy(student)
+                total["reference_entropy"] += entropy(teacher)
+                total["agreement"] += float(
+                    (student.argmax(-1) == teacher.argmax(-1).to(student.device)).sum()
+                )
+        return {k: v / len(y) for k, v in total.items()}
 
     def adapter_weights(self):
         return {

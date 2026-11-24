@@ -703,6 +703,12 @@ most a one-line label on an example.
   whether the set is precise enough to be the reference). Until both hold,
   the general anchors stay the "not broken" reference, as today. The check
   records which one gated and why (`drift_checks` in the cycle record).
+  Beside the mean drift, `gate_values` keeps for each version what that mean
+  does not show, on the set that gated: `base_entropy` and `entropy`
+  (nats/token, the base's and the version's), `entropy_change` (relative)
+  and `agreement` (the share of tokens where both prefer the same one), from
+  the same logits as the KL. Recorded only: they gate nothing. `None` where
+  not measured (the first Dream's incumbent is the base itself).
 
 - Under Dreams, "did it get better?" is judged on what each version writes
   (`sleep/judged.py`), not on the KL to the teacher along the original

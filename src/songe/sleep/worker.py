@@ -182,7 +182,7 @@ def run(
 ):
     from ..memory import TrainingPlatform
     from ..practice.pool import drift_steps
-    from .evaluate import evaluate, references
+    from .evaluate import evaluate, references, sharpness
     from .fuse import candidate_kind, evaluation_model, export_candidate
     from .gate import Decision, choose_scale, decide
     from .prompts import OversizedStep, UnusableStep, paired_prompts
@@ -954,6 +954,7 @@ def run(
                 "drift": mean(cache["drift_set"]) if cache.get("drift_set") else None,
                 "count": len(rows),
                 "drift_count": len(cache.get("drift_set") or []),
+                **sharpness(cache),
             }
             return rows
 
@@ -1084,6 +1085,7 @@ def run(
                     "drift": mean(cache["drift_set"]) if cache.get("drift_set") else None,
                     "count": len(rows),
                     "drift_count": len(cache.get("drift_set") or []),
+                    **sharpness(cache),
                 }
                 record.setdefault("drift_checks", {}).setdefault(name, cache.get("drift_check"))
             return rows

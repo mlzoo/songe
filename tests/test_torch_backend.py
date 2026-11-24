@@ -352,6 +352,29 @@ def test_heldout_kl_is_measured_against_the_cycle_start_teacher(backend, step):
     assert backend.compare(student, student, y) == pytest.approx(0, abs=1e-6)
 
 
+def test_measure_gives_entropy_and_agreement_with_the_kl(backend, step):
+    student, _ = paired_prompts(backend.tokenizer, step, backend.config)
+    y = [7, 8, 9, 10, 11]
+    backend.config.token_chunk = 2  # chunks of 2, 2 and 1 tokens
+    same = backend.measure(backend, student, student, y)
+    assert same["kl"] == pytest.approx(0, abs=1e-6) and same["agreement"] == 1
+    assert 0 < same["entropy"] == pytest.approx(same["reference_entropy"], rel=1e-5)
+    with backend.base():
+        logits = backend.head(backend.hidden(student + y[:-1])[:, -len(y):]).float()
+    expected = torch.special.entr(logits.softmax(-1)).sum(-1).mean().item()
+    assert same["reference_entropy"] == pytest.approx(expected, rel=1e-5)
+    generator = torch.Generator().manual_seed(3)
+    with torch.no_grad():
+        for p in backend.model.parameters():
+            if p.requires_grad:
+                p.add_(0.05 * torch.randn(p.shape, generator=generator))
+    moved = backend.measure(backend, student, student, y)
+    assert moved["kl"] == pytest.approx(backend.kl_from(backend, student, student, y)) and moved["kl"] > 1e-4
+    assert moved["reference_entropy"] == pytest.approx(same["reference_entropy"], rel=1e-5)
+    assert moved["entropy"] != same["entropy"]  # the version's own, not the base's
+    assert 0 <= moved["agreement"] <= 1
+
+
 def test_nucleus_filter_precedes_temperature_and_retains_boundary_ties():
     logits = torch.tensor([[0.5, 0.3, 0.2]]).log()
     actual = sampling_probabilities(logits, temperature=0.5, top_p=0.6)
