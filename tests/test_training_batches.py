@@ -51,20 +51,10 @@ def test_memory_changes_microbatch_geometry_without_changing_optimizer_batch(
     assert derive(rows, 1, accumulation=7)["accumulation"] == 7
 
 
-@pytest.mark.parametrize("kind", ["torch", "mlx"])
-@pytest.mark.parametrize("splits", [(1, 3, 2), (2, 2, 2), (6,)])
-def test_token_normalization_is_independent_of_microbatch_splits(
-    config, tmp_path, monkeypatch, kind, splits
-):
-    # The same six token derivatives are partitioned differently within one
-    # optimizer unit. A second, partial unit has a single token.
-    values = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
-    pool, offset = [], 0
-    for index, count in enumerate(splits):
-        pool.append({"id": str(index), "values": values[offset : offset + count]})
-        offset += count
-    pool.append({"id": "partial", "values": [0.8]})
-    backend = ScalarBackend(replace(config, accumulation=len(splits)), [0])
+def scalar_backend(config, monkeypatch, kind, accumulation):
+    """The production loop on scalar math, as torch or with MLX stand-ins. A
+    sample's loss and gradient are the mean over its own answer tokens."""
+    backend = ScalarBackend(replace(config, accumulation=accumulation), [0])
     if kind == "mlx":
 
         def tree_map(fn, *trees):
@@ -94,13 +84,69 @@ def test_token_normalization_is_independent_of_microbatch_splits(
         return mean, {"weight": mean}, tokens
 
     backend.train_step = microbatch
+    return backend
+
+
+@pytest.mark.parametrize("kind", ["torch", "mlx"])
+def test_a_sample_counts_once_whatever_the_length_of_its_answer(
+    config, tmp_path, monkeypatch, kind
+):
+    # One optimizer step over answers of one, three and two tokens, then a
+    # partial step with a single sample.
+    pool = [
+        {"id": "short", "values": [0.1]},
+        {"id": "long", "values": [0.2, 0.3, 0.4]},
+        {"id": "middle", "values": [0.5, 0.6]},
+        {"id": "partial", "values": [0.8]},
+    ]
+    backend = scalar_backend(config, monkeypatch, kind, 3)
     result = train(backend, pool, [], private_dir(tmp_path / "work"), lambda *_: None)
-    if len(splits) == 1:
-        # With a one-sample optimizer unit the final sample is another full unit.
-        assert result["iterations"] == 2
-    assert backend.gradients == pytest.approx([0.35, 0.8])
+    # The mean of the three samples' own means (0.1, 0.3, 0.55). Weighted by
+    # tokens it was 0.35: the three-token answer counted three times.
+    assert backend.gradients == pytest.approx([(0.1 + 0.3 + 0.55) / 3, 0.8])
     assert result["loss"] == pytest.approx(0.8)
-    assert result["steps_learned"] == len(pool)
+    assert result["iterations"] == 2 and result["steps_learned"] == len(pool)
+
+
+@pytest.mark.parametrize("kind", ["torch", "mlx"])
+def test_a_lesson_counts_once_however_many_of_its_scenes_were_kept(
+    config, tmp_path, monkeypatch, kind
+):
+    from songe.backends.training import sample_weights
+
+    # Lesson a kept three practice scenes, lesson b one.
+    pool = [
+        {"id": "a1", "signal_id": "a", "values": [0.1]},
+        {"id": "a2", "signal_id": "a", "values": [0.2]},
+        {"id": "a3", "signal_id": "a", "values": [0.3]},
+        {"id": "b1", "signal_id": "b", "values": [0.8]},
+    ]
+    weights = sample_weights(pool)
+    assert weights == pytest.approx([2 / 3, 2 / 3, 2 / 3, 2.0])
+    assert sum(weights) == pytest.approx(len(pool))  # 1 on average: the step size stays
+    backend = scalar_backend(config, monkeypatch, kind, 4)
+    result = train(backend, pool, [], private_dir(tmp_path / "work"), lambda *_: None)
+    # Half lesson a (the mean of its scenes), half lesson b; per scene it was 0.35.
+    assert backend.gradients == pytest.approx([(0.2 + 0.8) / 2])
+    assert result["loss"] == pytest.approx(0.5)
+    # Samples that are not practice scenes are their own unit: all count 1.
+    assert sample_weights([{"id": "x"}, {"id": "y"}, {"id": "z"}]) == [1.0, 1.0, 1.0]
+
+
+@pytest.mark.parametrize("kind", ["torch", "mlx"])
+def test_general_rehearsal_counts_one_beside_weighted_lessons(
+    config, tmp_path, monkeypatch, kind
+):
+    pool = [
+        {"id": "a1", "signal_id": "a", "values": [0.2]},
+        {"id": "a2", "signal_id": "a", "values": [0.4]},
+        {"id": "b1", "signal_id": "b", "values": [0.9]},
+    ]
+    anchors = [{"id": "g", "values": [0.6]}]
+    backend = scalar_backend(replace(config, anchor_fraction=0.25), monkeypatch, kind, 4)
+    train(backend, pool, anchors, private_dir(tmp_path / "work"), lambda *_: None)
+    # Scenes of a: 3 / (2 * 2) each; b: 3 / 2; the general prompt: 1.
+    assert backend.gradients == pytest.approx([(0.75 * 0.2 + 0.75 * 0.4 + 1.5 * 0.9 + 0.6) / 4])
 
 
 @pytest.mark.parametrize("resource", ["host", "device"])

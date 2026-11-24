@@ -38,6 +38,20 @@ def sample_plan(pool, anchors, fraction):
     return plan
 
 
+def sample_weights(pool):
+    """How much each pool sample counts in its optimizer step; 1 on average.
+
+    A lesson counts once however many of its practice scenes were kept (one
+    to practice_per_signal), so its samples share its weight. A sample that
+    is not a practice scene is its own unit and all weights are 1.
+    """
+    units = [step.get("signal_id") or step["id"] for step in pool]
+    scenes = {}
+    for unit in units:
+        scenes[unit] = scenes.get(unit, 0) + 1
+    return [len(pool) / (len(scenes) * scenes[unit]) for unit in units]
+
+
 CHECKPOINT_MIN_SECONDS = 30.0
 
 
@@ -95,6 +109,7 @@ def train(backend, pool, anchors, work, progress):
         )
 
     optimizer = backend.optimizer(schedule)
+    weights = sample_weights(pool)
     losses, learned = [], set()
     is_torch = backend.kind == "torch"
     if not is_torch:
@@ -184,7 +199,7 @@ def train(backend, pool, anchors, work, progress):
             # A step boundary: the slice deadline may stop here, never midway.
             getattr(backend, "boundary", backend.check)()
             step_started = time.monotonic()
-            gradients, loss, pending, tokens = None, 0.0, set(), 0
+            gradients, loss, pending = None, 0.0, set()
             batch = plan[cursor : cursor + accumulation]
             for micro, (is_anchor, index) in enumerate(batch):
                 step = anchors[index] if is_anchor else pool[index]
@@ -195,12 +210,19 @@ def train(backend, pool, anchors, work, progress):
                     raise ValueError("Non-finite training loss")
                 if count < 1:
                     raise ValueError("Training sample has no loss tokens")
-                if is_torch:
-                    # In place: each copy of a large adapter's gradients is
-                    # gigabytes of accelerator memory.
-                    grad = {n: _inplace(g, "mul_", count) for n, g in grad.items()}
-                else:
-                    grad = tree_map(lambda g, n=count: g * n, grad)
+                # Each sample's loss is already the mean over its own answer:
+                # samples are averaged as they are, not by answer length, so a
+                # 120-token answer does not count twelve times a 10-token tool
+                # call. A lesson's scenes share one lesson's weight; general
+                # rehearsal counts 1.
+                weight = 1.0 if is_anchor else weights[index]
+                if weight != 1.0:
+                    if is_torch:
+                        # In place: each copy of a large adapter's gradients
+                        # is gigabytes of accelerator memory.
+                        grad = {n: _inplace(g, "mul_", weight) for n, g in grad.items()}
+                    else:
+                        grad = tree_map(lambda g, w=weight: g * w, grad)
                 if not is_anchor:
                     pending.add(step["id"])
                 if gradients is None:
@@ -219,12 +241,12 @@ def train(backend, pool, anchors, work, progress):
                 # Return this micro-batch's freed buffers before the next one;
                 # otherwise accumulation grows the allocator cache by each shape.
                 getattr(backend, "release", lambda: None)()
-                loss += value * count
-                tokens += count
+                loss += value * weight
+            size = len(batch)
             if is_torch:
-                gradients = {n: _inplace(g, "div_", tokens) for n, g in gradients.items()}
+                gradients = {n: _inplace(g, "div_", size) for n, g in gradients.items()}
             else:
-                gradients = tree_map(lambda x, n=tokens: x / n, gradients)
+                gradients = tree_map(lambda x, n=size: x / n, gradients)
                 gradients, norm = backend.optim.clip_grad_norm(gradients, max_norm=1.0)
                 if not math.isfinite(float(norm)):
                     raise ValueError("Non-finite training gradient")
@@ -232,7 +254,7 @@ def train(backend, pool, anchors, work, progress):
             iteration += 1
             cursor += len(batch)
             learned.update(pending)
-            losses.append(loss / tokens)
+            losses.append(loss / size)
             step_times.append(time.monotonic() - step_started)
             if checkpoint_due():
                 save_checkpoint()
