@@ -76,7 +76,11 @@ def dreams(config, store, monkeypatch):
     monkeypatch.setattr(worker.signal, "signal", lambda *a: None)
     anchors = worker.general_steps()[:1]
     monkeypatch.setattr(worker, "general_steps", lambda: anchors)
-    monkeypatch.setattr(gate, "choose_scale", lambda *a, **kw: (None, Decision(False, "Test rejection"), {}))
+    def reject(scaled, before, *a, **kw):
+        before()  # as a candidate that reaches its rows: the incumbent's are measured then
+        return None, Decision(False, "Test rejection"), {}
+
+    monkeypatch.setattr(gate, "choose_scale", reject)
     return config, store
 
 
@@ -246,6 +250,12 @@ def test_gate_skips_bundled_prompts_when_the_drift_set_decides(config):
     assert evaluate(candidate, candidate, [], general, drift_refs=drift_refs, checkpoint=cache) == []
     assert calls == [f"d{i}" for i in range(12)]  # bundled prompts skipped
     assert cache["drift_check"]["source"] == "drift" and cache["drifts"] == []
+    # This backend measures the KL only: nothing is kept beside it.
+    from songe.sleep.evaluate import sharpness
+
+    assert cache["drift_set_shapes"] == [None] * 12
+    assert sharpness(cache) == {"base_entropy": None, "entropy": None, "entropy_change": None, "agreement": None}
+
     # Too few successes: the bundled prompts gate, and are measured.
     calls.clear()
     cache = {}
@@ -288,6 +298,44 @@ class Answering(Model):
 
     def compare(self, student, teacher, y, kind="forward_kl"):
         return 0.1 if y == [2] else 0.3
+
+def test_the_check_keeps_entropy_and_agreement_beside_the_drift():
+    """What a mean KL hides is kept for the set that gated; it gates nothing."""
+    from types import SimpleNamespace
+
+    from songe.sleep.evaluate import evaluate, sharpness
+
+    class Fake:
+        config = SimpleNamespace(min_drift=10, gate_confidence=0.95, general_drift_limit=0.05)
+        measured = []
+
+        def check(self):
+            pass
+
+        def measure(self, base, prompt, teacher, y, *, hindsight=False):
+            self.measured.append(prompt)
+            # The base's entropy, this version's (a fifth lower), agreement.
+            return {"kl": 0.01, "reference_entropy": 2.0, "entropy": 1.6, "agreement": 0.9}
+
+    candidate = Fake()
+    drift_refs = [{"conversation": f"c{i}", "prompt": f"d{i}", "y": []} for i in range(3)]
+    general = [{"prompt": f"g{i}", "y": []} for i in range(4)]
+    # Resumed: the first drift prompt was measured before these were kept.
+    cache = {"drift_set": [0.01]}
+    evaluate(candidate, candidate, [], general, drift_refs=drift_refs, checkpoint=cache)
+    assert candidate.measured == ["d1", "d2", "g0", "g1", "g2", "g3"]
+    assert cache["drift_set"] == [0.01] * 3 and cache["drifts"] == [0.01] * 4
+    assert cache["drift_set_shapes"] == [None, [2.0, 1.6, 0.9], [2.0, 1.6, 0.9]]
+    assert cache["drifts_shapes"] == [[2.0, 1.6, 0.9]] * 4
+    # Three conversations cannot gate yet: the general prompts did, so theirs.
+    assert cache["drift_check"]["source"] == "general"
+    assert sharpness(cache) == {"base_entropy": 2.0, "entropy": 1.6,
+                                "entropy_change": pytest.approx(-0.2), "agreement": 0.9}
+    # The first Dream's incumbent is the base itself: not measured.
+    cache = {}
+    evaluate(candidate, candidate, [], general, drift_refs=drift_refs, checkpoint=cache, identical=True)
+    assert cache["drifts_shapes"] == [None] * 4 and sharpness(cache)["entropy"] is None
+
 
 
 def add_lesson_signal(store, signal_id, source):
@@ -1011,3 +1059,42 @@ def test_a_pressed_deep_dream_whose_night_failed_retries_then_says_why(store):
     stopped = learner.get("dream_stopped")
     assert store.get("requested_sleep") is False and stopped["reason"] == "training"
     assert "failed 3 times" in stopped["detail"] and "SIGKILL" in stopped["detail"]
+
+
+def test_the_incumbents_measurements_are_kept_for_the_next_dream(tmp_path, config):
+    """kept_as: a second Dream with the same incumbent measures nothing it
+    measured before; a different fingerprint (a new incumbent) measures
+    again and replaces the old folder."""
+    from songe.sleep.evaluate import KeptMeasurements, evaluate
+
+    calls = []
+
+    class Fake:
+        def __init__(self):
+            self.config, self.tokenizer = config, None
+
+        def check(self):
+            pass
+
+        def kl_from(self, base, prompt, teacher, y, *, hindsight=False, **kw):
+            calls.append(("kl", prompt))
+            return 0.25
+
+        def sample(self, prompt, seed=None, **kw):
+            calls.append(("sample", prompt))
+            return [1], "done", None
+
+    v = Fake()
+    refs = [{"id": f"m{i}", "conversation": f"c{i}", "prompt": [i, 1], "teacher": [i, 2], "y": [3],
+             "tools": [], "tool_step": False} for i in range(3)]
+    drift_refs = [{"conversation": f"d{i}", "prompt": [9, i], "y": [4]} for i in range(12)]
+    first = evaluate(v, v, refs, [], drift_refs=drift_refs,
+                     kept_as=KeptMeasurements(tmp_path, ["incumbent-a"]))
+    assert len(calls) == 12 + 3 * 2
+    calls.clear()
+    again = evaluate(v, v, refs, [], drift_refs=drift_refs,
+                     kept_as=KeptMeasurements(tmp_path, ["incumbent-a"]))
+    assert calls == [] and again == first
+    evaluate(v, v, refs[:1], [], drift_refs=drift_refs,
+             kept_as=KeptMeasurements(tmp_path, ["incumbent-b"]))
+    assert len(calls) == 12 + 2 and len(list(tmp_path.iterdir())) == 1

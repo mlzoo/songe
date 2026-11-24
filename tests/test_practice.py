@@ -207,3 +207,36 @@ def test_not_copy_still_catches_copied_definitions():
     }
     files = {"vat.py": "def compute_vat(total):\n    return total\n"}
     assert checks.copy_evidence({"request": "x"}, files, ["y"], code) == ["compute_vat"]
+
+
+def test_a_chat_without_tools_or_system_message_gives_a_plain_scene():
+    """#136: a plain chat client sends no tools and no system message. The
+    user's question is not made a system message, and the scene writer is
+    told the agent has no tools, so it writes a conversation, not tool steps."""
+    from songe.practice import prompts
+    from songe.practice.frame import build, frame_from_request
+
+    request = {"messages": [{"role": "user", "content": "What is the capital of Australia?"}]}
+    frame = frame_from_request(request, "trip-notes")
+    assert frame["system"] == "" and frame["tools"] == []
+    scene = {
+        "moment": {"kind": "user_message", "step": {}, "agent_said": "Canberra.",
+                   "user_message": "And when was it founded?"},
+        "request": "What is the capital of Australia?", "files": [], "steps": [],
+    }
+    messages, problems, _ = build(scene, frame)
+    assert problems == []
+    assert [m["role"] for m in messages] == ["user", "assistant", "user"]
+    # The checks read the user's first message too (they skipped messages[0]).
+    from songe.practice.checks import render_text
+
+    assert render_text(messages).startswith("USER: What is the capital of Australia?")
+    # The scene writer is told there are no tools; an agent with tools is not.
+    assert prompts.tools_section(None, []) == prompts.NO_TOOLS
+    assert "no tools" in prompts.NO_TOOLS and "user_message" in prompts.NO_TOOLS
+    tools = [{"type": "function", "function": {"name": "read", "parameters": {"properties": {"path": {}}}}}]
+    shown = prompts.tools_section(tools, tools)
+    assert shown.startswith("The agent's tools") and "- read(path)" in shown
+    # A logged system prompt is still the frame's.
+    framed = frame_from_request({"messages": [{"role": "system", "content": "Be brief."}] + request["messages"]}, "x")
+    assert build(scene, framed)[0][0] == {"role": "system", "content": "Be brief."}

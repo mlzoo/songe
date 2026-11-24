@@ -2324,7 +2324,12 @@ class ModelScheduler(Scheduler):
             self.installation_store.set("requested_model", model)
         elif calibrating:
             if failed or memory_stop:
-                stop("measuring what this machine can train did not finish")
+                from .wording import DEVICE_FULL
+
+                # The card was full: say so and what to do (live #135: "did
+                # not finish" did not point at the user's own server).
+                full = learner.get("child_error") == DEVICE_FULL
+                stop(DEVICE_FULL if full else "measuring what this machine can train did not finish")
             else:
                 again()
         else:

@@ -64,7 +64,7 @@ STOCK_LESSONS = (
 def render_text(messages, limit=4000):
     """The scene as the agent would see it, minus the system prompt."""
     out = []
-    for m in (messages or [])[1:]:
+    for m in messages or []:
         if m["role"] == "user":
             out.append(f"USER: {m['content']}")
         elif m["role"] == "assistant":

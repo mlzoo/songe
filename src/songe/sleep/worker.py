@@ -38,6 +38,19 @@ from ..schedule import resumable as can_resume
 from ..steps import digest, revision_id
 from ..storage import private_dir, write_json
 
+# Tokens per no-gradient pass in the gate (see TorchBackend.read_chunk).
+GATE_READ_CHUNK = 4096
+
+
+def files_fingerprint(path):
+    """What a saved adapter is, for caches: its files' names, sizes and
+    modification times (a new adapter is written as new files)."""
+    path = Path(path)
+    files = sorted(p for p in path.rglob("*") if p.is_file()) if path.is_dir() else [path]
+    return digest([str(path)] + [
+        [p.name, p.stat().st_size, p.stat().st_mtime_ns] for p in files if p.exists()
+    ])
+
 
 def general_steps():
     prompts = json.loads(
@@ -182,9 +195,9 @@ def run(
 ):
     from ..memory import TrainingPlatform
     from ..practice.pool import drift_steps
-    from .evaluate import evaluate, references
+    from .evaluate import evaluate, references, sharpness
     from .fuse import candidate_kind, evaluation_model, export_candidate
-    from .gate import Decision, choose_scale, decide
+    from .gate import Decision, choose_scale, decide, judged_check
     from .prompts import OversizedStep, UnusableStep, paired_prompts
     from .samples import SampleAdmission
     from .select import bounded_batch, replay_pool, select
@@ -837,6 +850,12 @@ def run(
         }
         if any(s["id"] in waiting for s in night_gate):
             raise Interrupted("Waiting for memory: intact training samples deferred")
+        # The gate reads without gradients, after training: bigger chunks
+        # (fewer passes) are much faster where each pass has a fixed cost
+        # (Inkling-2-Mini unpacks its experts per pass: 4.5x at 32k), and
+        # halve themselves if memory runs short (TorchBackend.reading).
+        if backend.kind == "torch":
+            backend.read_chunk = max(GATE_READ_CHUNK, config.teacher_chunk)
 
         # Gate work is cached by what it scores (the examples and response
         # length), not by this slice's memory sizing, which changes almost
@@ -922,8 +941,27 @@ def run(
                 general_memo.append(reference_set("general-references", anchors))
             return general_memo[0]
 
-        def measured(name, candidate, identical=False):
-            name += "-" + gate_key(heldout + anchors + drift_set)
+        # The reference's read of each moment, shared by the versions below
+        # (it does not depend on the version measured); the base's reads are
+        # kept across Dreams (KeptViews).
+        from .evaluate import KeptViews
+
+        views = (
+            KeptViews(
+                store.root / "gate-views",
+                [base, "r2", config.teacher_chunk, GATE_READ_CHUNK, config.torch_options or {}],
+            )
+            if backend.kind == "torch"
+            else {}
+        )
+
+        def pass_name(name):
+            # r2: how contexts are read (one layout, 4096-token chunks); rows
+            # read another way are not comparable, so they are not resumed.
+            return name + "-r2-" + gate_key(heldout + anchors + drift_set)
+
+        def measured(name, candidate, identical=False, kept_as=None, rows=True):
+            name = pass_name(name)
             cache = journal.load(name, {})
 
             def commit():
@@ -935,7 +973,7 @@ def run(
                 )
 
             commit()
-            rows = evaluate(
+            result = evaluate(
                 backend,
                 candidate,
                 refs,
@@ -944,36 +982,74 @@ def run(
                 checkpoint=cache,
                 commit=commit,
                 identical=identical,
+                views=views,
+                kept_as=kept_as,
+                rows=rows,
             )
+            measured_rows = result if rows else []
             # Which "not broken" measure gated, and why (see evaluate), and
             # the measured values, for the cycle record's checks.
             record.setdefault("drift_checks", {})[name] = cache.get("drift_check")
             record.setdefault("gate_values", {})[name] = {
-                "held_out": mean(r["kl"] for r in rows) if rows else None,
+                "held_out": mean(r["kl"] for r in measured_rows) if measured_rows else None,
                 "general": mean(cache["drifts"]) if cache.get("drifts") else None,
                 "drift": mean(cache["drift_set"]) if cache.get("drift_set") else None,
-                "count": len(rows),
+                "count": len(measured_rows),
                 "drift_count": len(cache.get("drift_set") or []),
+                **sharpness(cache),
             }
-            return rows
+            return result  # rows=False: the "not broken" measure's value
 
+        # The incumbent's measurements are kept for the next Dreams while
+        # what they depend on stays the same (KeptMeasurements).
+        from .evaluate import KeptMeasurements
+
+        incumbent_adapter = incumbent_version and (
+            incumbent_version.get("training_adapter") or incumbent_version.get("adapter")
+        )
+        kept_incumbent = KeptMeasurements(
+            store.root / "gate-incumbent",
+            [
+                base,
+                files_fingerprint(incumbent_adapter) if incumbent_adapter else "original",
+                files_fingerprint(previous_adapter) if previous_adapter else "base",  # the teacher
+                "r2",
+                backend.kind,
+                config.response_tokens,
+                config.repetition_ngram,
+                config.teacher_chunk,
+                GATE_READ_CHUNK,
+                sorted((config.torch_options or {}).items()),
+            ],
+        )
         # The incumbent and candidate share the original frozen base. Reuse
         # its trunk so evaluating the incumbent does not load a second base.
-        if incumbent_version and (
-            incumbent_version.get("training_adapter")
-            or incumbent_version.get("adapter")
-        ):
-            backend.restore(
-                Path(
-                    incumbent_version.get("training_adapter")
-                    or incumbent_version["adapter"]
-                )
+        def load_incumbent():
+            if incumbent_adapter:
+                backend.restore(Path(incumbent_adapter))
+            else:
+                backend.scale_delta(baseline, trained, 0)
+
+        def measure_incumbent(rows=True):
+            # The incumbent is the original when it has no adapter: its drift
+            # from it is zero.
+            return measured(
+                "before", backend, identical=not incumbent_adapter, kept_as=kept_incumbent, rows=rows
             )
-            before = measured("before", backend)
-        else:
-            # The incumbent is the original: its drift from it is zero.
-            backend.scale_delta(baseline, trained, 0)
-            before = measured("before", backend, identical=True)
+
+        # Its "not broken" measure now; its held-out rows only when a
+        # candidate gets that far (before_rows), so a candidate rejected on
+        # drift or on the judged moments costs no rows at all.
+        load_incumbent()
+        measure_incumbent(rows=False)
+        incumbent_rows = []
+
+        def before_rows():
+            if not incumbent_rows:
+                load_incumbent()
+                incumbent_rows.append(measure_incumbent())
+            return incumbent_rows[0]
+
         # Under Dreams the gate judges what each version writes (judged.py):
         # the version in use answers each moment now, while it is loaded.
         from . import judged
@@ -982,7 +1058,9 @@ def run(
         before_answers = {}
         if moments:
             try:
-                before_answers = judged.answers(backend, journal, moments, "before", check)
+                before_answers = judged.answers(
+                    backend, journal, moments, "before", check, kept_as=kept_incumbent
+                )
             except (Interrupted, MemoryError):
                 raise
             except Exception as exc:  # noqa: BLE001 - judging falls back, never fails the Dream
@@ -1014,17 +1092,18 @@ def run(
         if others:
             before_others = answer_others("unrelated-before")
 
-        def with_outcomes(rows, scale):
-            """The gate's rows with each judged moment's outcome (win, loss,
-            tie) for this strength; the candidate is loaded at that strength."""
+        def judged_outcomes(scale):
+            """Each judged moment's outcome (win, loss, tie) for this
+            strength, {id: verdict}; {} when judging is unavailable (the KL
+            decides). The candidate is loaded at that strength."""
             if not moments:
-                return rows  # the KL decides (judging unavailable)
+                return {}
             backend.scale_delta(baseline, trained, scale)
             if others:
                 answer_others(f"unrelated-scale-{scale}")
             try:
                 after_answers = judged.answers(backend, journal, moments, f"scale-{scale}", check)
-                verdicts = {r["id"]: r for r in judged.judge(
+                return {r["id"]: r for r in judged.judge(
                     backend, journal, moments, before_answers, after_answers, f"scale-{scale}", check)}
             except (Interrupted, MemoryError):
                 raise
@@ -1033,9 +1112,11 @@ def run(
 
                 logging.getLogger("songe").warning("judged_unavailable %s: %s", type(exc).__name__, exc)
                 record["judged_error"] = type(exc).__name__
-                return rows
+                return {}
             finally:
                 backend.scale_delta(baseline, trained, scale)
+
+        def with_outcomes(rows, verdicts):
             return [r | ({"outcome": verdicts[r["id"]]["outcome"], "by": verdicts[r["id"]]["by"]}
                          if r["id"] in verdicts else {}) for r in rows]
 
@@ -1084,7 +1165,7 @@ def run(
         def scaled(scale):
             # A strength already measured in an earlier slice still counts in
             # the gate's progress, though its verdict comes from the journal.
-            name = f"scale-{scale}-" + gate_key(heldout + anchors + drift_set)
+            name = pass_name(f"scale-{scale}")
             cache = journal.load(name, {})
             if cache:
                 gate_progress(
@@ -1095,11 +1176,11 @@ def run(
             # The verdict's evidence is kept, so a resumed gate never reopens a
             # discarded candidate.
             rows = journal.unit(
-                f"scale-result-{scale}-{gate_key(heldout + anchors + drift_set)}",
+                pass_name(f"scale-result-{scale}"),
                 lambda: evaluate_scale(scale),
             )
             values = record.setdefault("gate_values", {})
-            if name not in values and rows:
+            if name not in values and isinstance(rows, list) and rows:
                 # Resumed after this strength was measured: its values come
                 # from the journal (live: a resumed night kept one strength's).
                 values[name] = {
@@ -1108,13 +1189,35 @@ def run(
                     "drift": mean(cache["drift_set"]) if cache.get("drift_set") else None,
                     "count": len(rows),
                     "drift_count": len(cache.get("drift_set") or []),
+                    **sharpness(cache),
                 }
                 record.setdefault("drift_checks", {}).setdefault(name, cache.get("drift_check"))
             return rows
 
         def evaluate_scale(scale):
             scale_adapter(scale)
-            adapted = with_outcomes(measured(f"scale-{scale}", backend), scale)
+            # Rejected early when the remaining rows cannot change the
+            # outcome: decide() fails a candidate whose drift is over the
+            # limit, or whose judged moments are not clearly better, whatever
+            # its held-out rows hold.
+            drift = measured(f"scale-{scale}", backend, rows=False)
+            if drift is not None and drift > config.general_drift_limit:
+                return {"early": Decision(
+                    False, "General behaviour drift exceeds the limit", general_drift=drift
+                ).dict(), "judged": []}
+            verdicts = judged_outcomes(scale)
+            judged_rows = [
+                {"id": s["id"], "conversation": s["conversation"], **{
+                    k: verdicts[s["id"]][k] for k in ("outcome", "by")}}
+                for s in heldout if s["id"] in verdicts
+            ]
+            rejected = judged_check(judged_rows, confidence=config.gate_confidence)
+            if rejected is not None:
+                rejected.general_drift = drift
+                return {"early": rejected.dict(), "judged": judged_rows}
+            before = before_rows()
+            scale_adapter(scale)
+            adapted = with_outcomes(measured(f"scale-{scale}", backend), verdicts)
             adapter_verdict = decide(
                 before,
                 adapted,
@@ -1155,7 +1258,7 @@ def run(
 
         scale, decision, scales = choose_scale(
             scaled,
-            before,
+            before_rows,
             config.wake_scales,
             min_heldout=config.min_heldout,
             drift_limit=config.general_drift_limit,

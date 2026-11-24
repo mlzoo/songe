@@ -24,7 +24,13 @@ import time
 import unicodedata
 
 from .reading import store as reading
-from .reading.rules import DEICTIC, RULE_START, SENTENCES, rule_sentence  # noqa: F401
+from .reading.rules import (  # noqa: F401
+    DEICTIC,
+    RULE_START,
+    SENTENCES,
+    rule_sentence,
+    stated_sentence,
+)
 from .steps import digest
 
 KEY = "prompt_lessons"
@@ -38,9 +44,15 @@ COMMON = {
     "not", "do", "are", "from", "at", "before", "after", "any", "its", "e", "g",
 }
 
-BLOCK = (
-    "Lessons from earlier sessions with this user. Follow them unless the"
-    " current request says otherwise:"
+BLOCK = "Lessons from earlier sessions with this user. Follow them:"
+# The request at hand wins over a lesson. Said after the list, next to the
+# request: said in the heading only ("Follow them unless the current request
+# says otherwise"), a small model kept to the lesson when the user asked, in
+# so many words, for the opposite just this once.
+EXCEPTIONS = (
+    "People make exceptions. When the current request asks for an exception to"
+    " one of these, give the user what they ask for this time. In every other"
+    " request, follow them."
 )
 
 
@@ -86,11 +98,26 @@ def active(store):
 
 def suitable(signal):
     """A lesson for the prompt: one read as applying to any task ("always":
-    tool facts, standing preferences), or a rule the user stated in their own
-    words (a sentence of theirs shaped like a rule). Other feedback (a
-    reaction in a game, a one-off correction) waits for Deep Dream."""
+    tool facts, standing preferences), a rule the user stated in their own
+    words (a sentence of theirs shaped like a rule), or what the user said in
+    a turn judged to be a standing wish. Other feedback (a reaction in a game,
+    a one-off correction) waits for Deep Dream."""
     lesson = (signal.get("lesson") or "").strip()
-    if not lesson or signal.get("generality") == "task":
+    if not lesson:
+        return False
+    if signal.get("preference"):
+        # A preference of the user's own, in their words: it holds whatever
+        # the lesson written beside it was read as.
+        return stated_sentence(signal) is not None
+    turn = signal.get("turn_kind")
+    if turn and signal.get("source") == "user" and signal.get("from") != "rules":
+        # Reading judged what the user's turn was (prompts.TURN), and that
+        # decides, whatever label the lesson got: a standing wish is for the
+        # prompt at once; a change wanted once is a candidate that has to come
+        # up in two conversations (candidates); new work and reactions are
+        # not for the prompt. A sentence shaped like a rule stays a rule.
+        return turn in ("lasting", "once") or rule_sentence(signal.get("text")) is not None
+    if signal.get("generality") == "task":
         return False
     if signal.get("from") == "rules" and signal.get("source") == "user":
         # A stated rule captured by an older Songe is checked again by today's
@@ -109,7 +136,7 @@ def candidates(store, limit, min_sessions=2):
     clusters = []
     # Newest first: a cluster is named by its most recent wording.
     for s in sorted(signals, key=lambda s: s.get("revision") or 0, reverse=True):
-        rule = rule_sentence(s.get("text")) if s.get("type") in USER else None
+        rule = stated_sentence(s) if s.get("type") in USER else None
         # The short form reading wrote for the prompt, when it has one (signals
         # read before it existed fall back to the lesson, trimmed by tidy).
         text = rule or short_of(s) or s["lesson"].strip()
@@ -129,7 +156,15 @@ def candidates(store, limit, min_sessions=2):
     # A tool fact or standing preference read as "always" enters the prompt
     # once it has come up in two conversations; a rule the user stated, at once.
     sessions = {s["id"]: s.get("session") for s in signals}
-    clusters = [c for c in clusters if c.get("rule") or len({sessions.get(i) for i in c["signals"]}) >= min_sessions]
+    # A change the user wanted once ("make it shorter") is a lesson for the
+    # prompt only when the same wish came up in another conversation too.
+    once = {s["id"] for s in signals if s.get("turn_kind") == "once" and s.get("source") == "user"}
+
+    def enough(c):
+        need = max(min_sessions, 2) if all(i in once for i in c["signals"]) else min_sessions
+        return len({sessions.get(i) for i in c["signals"]}) >= need
+
+    clusters = [c for c in clusters if c.get("rule") or enough(c)]
     clusters.sort(key=lambda c: (-len(c["signals"]), -c["newest"]))
     return clusters[:limit]
 
@@ -163,7 +198,10 @@ CONSOLIDATE_SCHEMA = {
     },
     "required": ["lessons"],
 }
-PROMPT_CHARS = 600  # about 150 tokens for the whole list, on every request
+# About 300 tokens for the whole list, on every request. At 600 characters ten
+# sentences in a user's own words (about 60 to 90 characters each) did not
+# fit: on average 7.9 of 10 did.
+PROMPT_CHARS = 1200
 # The model repeating its instruction instead of writing one ("Merge lessons
 # 1, 2, 4 into one instruction: …").
 ECHO = re.compile(r"\blessons?\b|\b(merge|combine)\b|\b\d+\s*,\s*\d+", re.I)
@@ -300,7 +338,7 @@ def user_rule(by_id, signal_ids):
     The most recent such sentence, or None."""
     for sid in signal_ids:
         s = by_id.get(sid) or {}
-        if s.get("type") in USER and (sentence := rule_sentence(s.get("text"))):
+        if s.get("type") in USER and (sentence := stated_sentence(s)):
             return sentence
     return None
 
@@ -322,7 +360,11 @@ def split(store, clusters):
         if ECHO.search(lesson["text"]):
             return False
         if lesson.get("rule"):
-            return rule_sentence(lesson["text"]) == lesson["text"]
+            # The user's own sentence: a standing rule, or a preference of
+            # theirs that one of its signals still holds.
+            return rule_sentence(lesson["text"]) == lesson["text"] or any(
+                stated_sentence(by_id[sid]) == lesson["text"] for sid in lesson["signals"] if sid in by_id
+            )
         return any(suitable(by_id[sid]) for sid in lesson["signals"] if sid in by_id)
 
     published = [dict(lesson, signals=list(lesson["signals"])) for lesson in active(store) if still_belongs(lesson)]
@@ -542,7 +584,7 @@ def block(lessons):
     """The text added to the system message."""
     if not lessons:
         return ""
-    return "\n".join([BLOCK, *(f"- {lesson['text']}" for lesson in lessons)])
+    return "\n".join([BLOCK, *(f"- {lesson['text']}" for lesson in lessons), EXCEPTIONS])
 
 
 # ---- Before and after: what a new preference changes ----------------------
