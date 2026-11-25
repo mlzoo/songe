@@ -33,9 +33,17 @@ class Writer(FakeReader):
         return await super().ask(prompt, schema, name)
 
 
-def written(store, scene=None, pick=None, per_signal=1):
-    record_session(store)
+def corrected_twice(store):
+    """The same correction in two conversations. Judged a change wanted once
+    (test_reading.ANSWERS), it is a lesson to practise only when it comes up
+    again, as it is a note only then (quick.admitted)."""
+    record_session(store, ask="fix the other failing test")
+    record_session(store)  # the newest: the one its scenes are framed on
     asyncio.run(reading.read(store, FakeReader()))
+
+
+def written(store, scene=None, pick=None, per_signal=1):
+    corrected_twice(store)
     writer = Writer(scene, pick)
     asyncio.run(practice.write(store, writer, per_signal))
     return practice.practice(store), writer
@@ -57,7 +65,7 @@ def test_a_scene_is_framed_on_the_logged_request_and_kept(store):
     # The prompt carries the lesson and a short summary, never the session.
     assert "Check which file the failing test covers" in writer.prompts[0]
     assert "fix the failing test" not in writer.prompts[0]
-    # One session only: the forced choice still runs, against a stock lesson.
+    # One lesson only: the forced choice still runs, against a stock lesson.
     assert writer.asked == ["dream", "matters"] and row["checks"]["matters"] is True
     assert any(f": {text}\n" in writer.prompts[1] for text in STOCK_LESSONS)
 
@@ -78,8 +86,7 @@ def test_a_scene_with_an_unknown_tool_does_not_build(store):
 
 
 def test_the_forced_choice_drops_scenes_about_something_else(store):
-    record_session(store)
-    asyncio.run(reading.read(store, FakeReader()))
+    corrected_twice(store)
     # A second session with a different lesson gives the placebo.
     with store.connect() as db:
         db.execute(
@@ -114,7 +121,7 @@ def test_a_repeated_lesson_from_another_session_cannot_be_its_own_placebo(store)
 
 
 def test_a_first_session_scene_about_something_else_is_dropped(store):
-    # With one session there is no other lesson to compare with; the scene
+    # With one lesson there is no other lesson to compare with; the scene
     # used to be kept unchecked (matters stayed None, and None is not a drop).
     row = written(store, pick="neither")[0][0]
     assert row["checks"]["matters"] is False and row["drop"] == "matters"
@@ -148,17 +155,26 @@ def test_scenes_are_written_up_to_the_target_and_go_with_their_signal(store):
     counts = practice.counts(store)
     assert counts == {"written": 2, "kept": 2, "dropped": 0, "dropped_by": {}}
     # The session is read again and its signal is gone: so are its scenes.
+    session = rows[0]["signal"]["session"]
     with store.connect() as db:
-        session, ids = next(iter(timeline.sessions(db).items()))
+        ids = timeline.sessions(db)[session]
     reading.save(store, session, max(ids) + 1, [], [])
     assert practice.practice(store) == []
 
 
 def test_forget_deletes_practice(store):
+    from songe.practice.pool import REJECTED
+
     written(store)
+    # Scene ids start again after forgetting: what a rejected Dream trained
+    # must not match the new ones (they were then never untrained).
+    other = store.scoped("another-model")
+    for view in (store, other):
+        view.set(REJECTED, {"practice:x#v1": [3, 1]})
     store.forget()
     with store.connect() as db:
         assert db.execute("SELECT COUNT(*) FROM practice").fetchone()[0] == 0
+    assert store.get(REJECTED) is None and other.get(REJECTED) is None
 
 
 def test_not_copy_catches_non_latin_verbatim_requests():

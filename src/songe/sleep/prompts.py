@@ -6,10 +6,96 @@ class UnusableStep(ValueError):
     pass
 
 
+# Template switches that reproduce how the user's server prompts this model,
+# where that differs from the chat template's default (see served_switches).
+# Every prompt rendered in this process gets them.
+SERVED = {}
+
+
+def serve_as(switches):
+    SERVED.clear()
+    SERVED.update(switches or {})
+
+
+def reasoned(message):
+    """Whether a recorded answer carries reasoning: its own field (servers
+    name it reasoning_content or reasoning) or <think> text in the content."""
+    if any(
+        isinstance(message.get(k), str) and message[k].strip()
+        for k in ("reasoning_content", "reasoning")
+    ):
+        return True
+    content = message.get("content")
+    return isinstance(content, str) and "<think>" in content
+
+
+def served_switches(store, recent=20):
+    """The template switches the recorded answers call for.
+
+    A reasoning model's template starts every answer inside its reasoning
+    unless a switch says otherwise. A server told not to reason (vLLM
+    --default-chat-template-kwargs, LM Studio's toggle, a client that sends
+    enable_thinking false) answers directly instead. Rendered with the
+    template's default, training and the check would then run on reasoning
+    text that this server never produces, from a prompt it never sends.
+
+    The last recorded answers say which it is: when none of them carries
+    reasoning, prompts are rendered with enable_thinking=False. Templates
+    without that switch ignore it, so a model that never reasons is rendered
+    as before. No recorded answer, or any with reasoning: the default.
+
+    Only this learner's own answers count (a scoped store: the answers its
+    versions gave), so a model that reasons and one that does not, served by
+    one installation, do not decide each other's setting. And a streamed
+    answer without reasoning says nothing when it was recorded before the
+    proxy kept a stream's reasoning under either field name (the store's
+    streamed_reasoning_from mark): vLLM's was dropped then, and right after
+    an upgrade a reasoning model would be rendered as one that does not."""
+    from .. import parts
+
+    mine = ""
+    names = ()
+    if store.model_key:
+        # What the proxy records as the binding: the version that answered,
+        # or "<model>:base" before the model had one.
+        names = (*sorted(v["id"] for v in store.versions()), f"{store.model_key}:base")
+        mine = f" AND binding IN ({','.join('?' * len(names))})"
+    with store.connect() as db:
+        rows = db.execute(
+            "SELECT * FROM exchanges WHERE status=200 AND response IS NOT NULL"
+            f" AND path LIKE '%chat/completions'{mine} ORDER BY id DESC LIMIT ?",
+            (*names, recent),
+        ).fetchall()
+        mark = db.execute("SELECT value FROM state WHERE key='streamed_reasoning_from'").fetchone()
+        mark = int(mark[0]) if mark and str(mark[0]).isdigit() else 0
+        answers = with_reasoning = 0
+        for row in rows:
+            try:
+                message = json.loads(row["response"])["choices"][0]["message"]
+            except (ValueError, LookupError, TypeError):
+                continue
+            if not isinstance(message, dict) or not (
+                message.get("content") or message.get("tool_calls") or reasoned(message)
+            ):
+                continue
+            if row["id"] <= mark and not reasoned(message):
+                try:
+                    streamed = bool(parts.request(db, row).get("stream"))
+                except (ValueError, LookupError, TypeError, AttributeError):
+                    streamed = True
+                if streamed:
+                    continue
+            answers += 1
+            with_reasoning += reasoned(message)
+    return {"enable_thinking": False} if answers and not with_reasoning else {}
+
+
 def render(tokenizer, messages, tools, **template):
     """The chat template's tokens; `template` passes extra template switches
     (enable_thinking=False for a short judge's answer; templates ignore
-    switches they do not know)."""
+    switches they do not know). The switches of the user's server (SERVED)
+    apply unless the caller sets its own."""
+    template = SERVED | template
     try:
         return tokenizer.apply_chat_template(
             messages,

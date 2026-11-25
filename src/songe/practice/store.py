@@ -72,9 +72,18 @@ def clusters(signals, have=None):
 
 
 def lesson_signals(store):
+    """The signals Deep Dream practises: those of LESSON_TYPES with the
+    evidence a note needs, and no others (quick.admitted, one bar for both).
+    A lesson that does not fit the prompt (one kind of task) is practised
+    all the same."""
+    from ..quick import admitted, evidenced
     from ..reading.store import signals
 
-    return [s for s in signals(store, types=LESSON_TYPES) if s.get("lesson") and s.get("exchanges")]
+    allowed = {i for cluster in admitted(store, fits=evidenced) for i in cluster["signals"]}
+    return [
+        s for s in signals(store, types=LESSON_TYPES)
+        if s.get("lesson") and s.get("exchanges") and s["id"] in allowed
+    ]
 
 
 def cluster_of(store):
